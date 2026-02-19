@@ -1,0 +1,774 @@
+# ============================================================
+# CHAIN HOST — Docker Compose Orchestration
+# 22+ Services | Hardened | Production-Ready
+# ============================================================
+
+services:
+  # ─────────────────────────────────────────────────────────
+  # REVERSE PROXY — Traefik v3
+  # ─────────────────────────────────────────────────────────
+  traefik:
+    image: traefik:v3.2
+    container_name: chainhost-traefik
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./security/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./security/traefik/dynamic:/etc/traefik/dynamic:ro
+      - traefik-certs:/letsencrypt
+      - traefik-logs:/var/log/traefik
+    networks:
+      - proxy
+      - crowdsec
+    environment:
+      - TZ=${TZ:-UTC}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.traefik.rule=Host(`traefik.${DOMAIN}`)"
+      - "traefik.http.routers.traefik.entrypoints=websecure"
+      - "traefik.http.routers.traefik.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.traefik.service=api@internal"
+      - "traefik.http.routers.traefik.middlewares=auth-dashboard,security-headers,rate-limit"
+      - "traefik.http.middlewares.auth-dashboard.basicauth.users=${TRAEFIK_DASHBOARD_AUTH}"
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ─────────────────────────────────────────────────────────
+  # DATABASE — PostgreSQL 16
+  # ─────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: chainhost-postgres
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./backend/prisma/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - backend
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "1.0"
+
+  # ─────────────────────────────────────────────────────────
+  # CONNECTION POOLER — PgBouncer
+  # ─────────────────────────────────────────────────────────
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: chainhost-pgbouncer
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      MAX_CLIENT_CONN: ${PGBOUNCER_MAX_CLIENT_CONN:-200}
+      DEFAULT_POOL_SIZE: ${PGBOUNCER_DEFAULT_POOL_SIZE:-25}
+      POOL_MODE: transaction
+    networks:
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -p 6432"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────────────────────
+  # CACHE — Redis 7
+  # ─────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: chainhost-redis
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+      --protected-mode yes
+      --rename-command FLUSHALL ""
+      --rename-command FLUSHDB ""
+      --rename-command DEBUG ""
+    volumes:
+      - redis-data:/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
+
+  # ─────────────────────────────────────────────────────────
+  # OBJECT STORAGE — MinIO (S3-compatible)
+  # ─────────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: chainhost-minio
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_BROWSER_REDIRECT_URL: https://storage.${DOMAIN}
+    volumes:
+      - minio-data:/data
+    networks:
+      - backend
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.minio-console.rule=Host(`storage.${DOMAIN}`)"
+      - "traefik.http.routers.minio-console.entrypoints=websecure"
+      - "traefik.http.routers.minio-console.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.minio-console.service=minio-console"
+      - "traefik.http.services.minio-console.loadbalancer.server.port=9001"
+      - "traefik.http.routers.minio-api.rule=Host(`s3.${DOMAIN}`)"
+      - "traefik.http.routers.minio-api.entrypoints=websecure"
+      - "traefik.http.routers.minio-api.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.minio-api.service=minio-api"
+      - "traefik.http.services.minio-api.loadbalancer.server.port=9000"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ─────────────────────────────────────────────────────────
+  # IPFS — Decentralized Storage
+  # ─────────────────────────────────────────────────────────
+  ipfs:
+    image: ipfs/kubo:latest
+    container_name: chainhost-ipfs
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ipfs-data:/data/ipfs
+      - ipfs-staging:/export
+    networks:
+      - backend
+    environment:
+      IPFS_PROFILE: server
+    ports:
+      - "127.0.0.1:5001:5001"
+    healthcheck:
+      test: ["CMD-SHELL", "ipfs dag stat /ipfs/QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ─────────────────────────────────────────────────────────
+  # BLOCKCHAIN — Hardhat (Dev) / configurable for prod
+  # ─────────────────────────────────────────────────────────
+  ganache:
+    image: trufflesuite/ganache:latest
+    container_name: chainhost-ganache
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command: >
+      --chain.chainId ${BLOCKCHAIN_CHAIN_ID:-1337}
+      --wallet.totalAccounts 10
+      --wallet.defaultBalance 1000
+      --miner.blockGasLimit 30000000
+    networks:
+      - backend
+    ports:
+      - "127.0.0.1:8545:8545"
+    profiles:
+      - dev
+
+  # ─────────────────────────────────────────────────────────
+  # MAIL SERVER — docker-mailserver (hardened)
+  # ─────────────────────────────────────────────────────────
+  mailserver:
+    image: ghcr.io/docker-mailserver/docker-mailserver:latest
+    container_name: chainhost-mailserver
+    hostname: ${MAIL_HOSTNAME}
+    domainname: ${MAIL_DOMAIN}
+    restart: unless-stopped
+    stop_grace_period: 1m
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "25:25"
+      - "465:465"
+      - "587:587"
+      - "993:993"
+    volumes:
+      - mail-data:/var/mail
+      - mail-state:/var/mail-state
+      - mail-logs:/var/log/mail
+      - ./mail/config/:/tmp/docker-mailserver/
+      - traefik-certs:/etc/letsencrypt/live:ro
+    environment:
+      - ENABLE_CLAMAV=${ENABLE_CLAMAV:-1}
+      - ENABLE_FAIL2BAN=${ENABLE_FAIL2BAN:-1}
+      - ENABLE_SPAMASSASSIN=${ENABLE_SPAMASSASSIN:-1}
+      - SPAMASSASSIN_SPAM_TO_INBOX=1
+      - ENABLE_OPENDKIM=${ENABLE_OPENDKIM:-1}
+      - ENABLE_OPENDMARC=${ENABLE_OPENDMARC:-1}
+      - ENABLE_POLICYD_SPF=${ENABLE_POLICYD_SPF:-1}
+      - SSL_TYPE=letsencrypt
+      - PERMIT_DOCKER=none
+      - ONE_DIR=1
+      - POSTFIX_INET_PROTOCOLS=ipv4
+      - POSTMASTER_ADDRESS=${MAIL_POSTMASTER}
+      - RELAY_HOST=${MAIL_RELAY_HOST}
+      - RELAY_PORT=${MAIL_RELAY_PORT:-587}
+      - RELAY_USER=${MAIL_RELAY_USER}
+      - RELAY_PASSWORD=${MAIL_RELAY_PASSWORD}
+      - ENABLE_POSTGREY=1
+      - POSTGREY_DELAY=300
+      - POSTGREY_MAX_AGE=35
+      - POSTGREY_TEXT=Delayed by postgrey
+    networks:
+      - mail
+      - proxy
+    healthcheck:
+      test: ["CMD-SHELL", "ss --listening --tcp | grep -P 'LISTEN.+:smtp' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ─────────────────────────────────────────────────────────
+  # WEBMAIL — Roundcube
+  # ─────────────────────────────────────────────────────────
+  roundcube:
+    image: roundcube/roundcubemail:latest
+    container_name: chainhost-roundcube
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      ROUNDCUBEMAIL_DEFAULT_HOST: tls://mailserver
+      ROUNDCUBEMAIL_DEFAULT_PORT: 993
+      ROUNDCUBEMAIL_SMTP_SERVER: tls://mailserver
+      ROUNDCUBEMAIL_SMTP_PORT: 465
+      ROUNDCUBEMAIL_DB_TYPE: pgsql
+      ROUNDCUBEMAIL_DB_HOST: postgres
+      ROUNDCUBEMAIL_DB_PORT: 5432
+      ROUNDCUBEMAIL_DB_NAME: roundcube
+      ROUNDCUBEMAIL_DB_USER: ${POSTGRES_USER}
+      ROUNDCUBEMAIL_DB_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - roundcube-data:/var/roundcube/db
+    networks:
+      - mail
+      - backend
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.roundcube.rule=Host(`mail.${DOMAIN}`)"
+      - "traefik.http.routers.roundcube.entrypoints=websecure"
+      - "traefik.http.routers.roundcube.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.roundcube.middlewares=security-headers,rate-limit"
+      - "traefik.http.services.roundcube.loadbalancer.server.port=80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ─────────────────────────────────────────────────────────
+  # GIT HOSTING — Forgejo
+  # ─────────────────────────────────────────────────────────
+  forgejo:
+    image: codeberg.org/forgejo/forgejo:9
+    container_name: chainhost-forgejo
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - USER_UID=1000
+      - USER_GID=1000
+      - FORGEJO__database__DB_TYPE=postgres
+      - FORGEJO__database__HOST=postgres:5432
+      - FORGEJO__database__NAME=forgejo
+      - FORGEJO__database__USER=${POSTGRES_USER}
+      - FORGEJO__database__PASSWD=${POSTGRES_PASSWORD}
+      - FORGEJO__server__DOMAIN=${FORGEJO_DOMAIN}
+      - FORGEJO__server__ROOT_URL=https://${FORGEJO_DOMAIN}
+      - FORGEJO__server__SSH_DOMAIN=${FORGEJO_DOMAIN}
+      - FORGEJO__server__SSH_PORT=${FORGEJO_SSH_PORT:-2222}
+      - FORGEJO__mailer__ENABLED=true
+      - FORGEJO__mailer__PROTOCOL=smtps
+      - FORGEJO__mailer__SMTP_ADDR=mailserver
+      - FORGEJO__mailer__SMTP_PORT=465
+      - FORGEJO__security__SECRET_KEY=${FORGEJO_SECRET_KEY}
+      - FORGEJO__security__INSTALL_LOCK=true
+    volumes:
+      - forgejo-data:/data
+    networks:
+      - backend
+      - proxy
+    ports:
+      - "${FORGEJO_SSH_PORT:-2222}:22"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.forgejo.rule=Host(`git.${DOMAIN}`)"
+      - "traefik.http.routers.forgejo.entrypoints=websecure"
+      - "traefik.http.routers.forgejo.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.forgejo.middlewares=security-headers"
+      - "traefik.http.services.forgejo.loadbalancer.server.port=3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ─────────────────────────────────────────────────────────
+  # WORKFLOW AUTOMATION — n8n
+  # ─────────────────────────────────────────────────────────
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: chainhost-n8n
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - N8N_HOST=${N8N_HOST}
+      - N8N_PORT=${N8N_PORT:-5678}
+      - N8N_PROTOCOL=${N8N_PROTOCOL:-https}
+      - WEBHOOK_URL=https://${N8N_HOST}/
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=n8n
+      - DB_POSTGRESDB_USER=${POSTGRES_USER}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - n8n-data:/home/node/.n8n
+    networks:
+      - backend
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.n8n.rule=Host(`n8n.${DOMAIN}`)"
+      - "traefik.http.routers.n8n.entrypoints=websecure"
+      - "traefik.http.routers.n8n.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.n8n.middlewares=security-headers,rate-limit"
+      - "traefik.http.services.n8n.loadbalancer.server.port=5678"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ─────────────────────────────────────────────────────────
+  # BACKEND API — Chain Host (Node.js)
+  # ─────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: production
+    container_name: chainhost-backend
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      - NODE_ENV=${NODE_ENV:-production}
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:6432/${POSTGRES_DB}
+      - REDIS_URL=${REDIS_URL}
+      - JWT_SECRET=${JWT_SECRET}
+      - JWT_EXPIRY=${JWT_EXPIRY:-24h}
+      - JWT_REFRESH_EXPIRY=${JWT_REFRESH_EXPIRY:-7d}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
+      - MINIO_PORT=${MINIO_PORT:-9000}
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      - MINIO_USE_SSL=${MINIO_USE_SSL:-false}
+      - IPFS_API_URL=${IPFS_API_URL}
+      - BLOCKCHAIN_RPC_URL=${BLOCKCHAIN_RPC_URL}
+      - BLOCKCHAIN_CHAIN_ID=${BLOCKCHAIN_CHAIN_ID:-1337}
+      - RATE_LIMIT_WINDOW_MS=${RATE_LIMIT_WINDOW_MS:-900000}
+      - RATE_LIMIT_MAX_REQUESTS=${RATE_LIMIT_MAX_REQUESTS:-100}
+    networks:
+      - backend
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.backend.rule=Host(`api.${DOMAIN}`)"
+      - "traefik.http.routers.backend.entrypoints=websecure"
+      - "traefik.http.routers.backend.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.backend.middlewares=security-headers,rate-limit,cors-headers"
+      - "traefik.http.services.backend.loadbalancer.server.port=3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/health').then(r => r.ok ? process.exit(0) : process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ─────────────────────────────────────────────────────────
+  # FRONTEND — Next.js Dashboard
+  # ─────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: production
+    container_name: chainhost-frontend
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      - NEXT_PUBLIC_API_URL=https://api.${DOMAIN}
+      - NEXT_PUBLIC_WS_URL=wss://api.${DOMAIN}
+      - NEXT_PUBLIC_DOMAIN=${DOMAIN}
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.frontend.rule=Host(`${DOMAIN}`) || Host(`www.${DOMAIN}`)"
+      - "traefik.http.routers.frontend.entrypoints=websecure"
+      - "traefik.http.routers.frontend.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.frontend.middlewares=security-headers,compress-response"
+      - "traefik.http.services.frontend.loadbalancer.server.port=3000"
+    depends_on:
+      - backend
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000').then(r => r.ok ? process.exit(0) : process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ─────────────────────────────────────────────────────────
+  # JOB QUEUE WORKER — BullMQ
+  # ─────────────────────────────────────────────────────────
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: production
+    container_name: chainhost-worker
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    command: ["node", "dist/worker.js"]
+    environment:
+      - NODE_ENV=${NODE_ENV:-production}
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:6432/${POSTGRES_DB}
+      - REDIS_URL=${REDIS_URL}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
+      - MINIO_PORT=${MINIO_PORT:-9000}
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      - IPFS_API_URL=${IPFS_API_URL}
+      - BLOCKCHAIN_RPC_URL=${BLOCKCHAIN_RPC_URL}
+    networks:
+      - backend
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  # ─────────────────────────────────────────────────────────
+  # MONITORING — Prometheus
+  # ─────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: chainhost-prometheus
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    user: "65534:65534"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - monitoring
+      - backend
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ─────────────────────────────────────────────────────────
+  # MONITORING — Grafana
+  # ─────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: chainhost-grafana
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GF_SECURITY_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD}
+      - GF_SERVER_ROOT_URL=${GF_SERVER_ROOT_URL}
+      - GF_INSTALL_PLUGINS=${GF_INSTALL_PLUGINS}
+      - GF_SECURITY_DISABLE_GRAVATAR=true
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - monitoring
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.grafana.rule=Host(`grafana.${DOMAIN}`)"
+      - "traefik.http.routers.grafana.entrypoints=websecure"
+      - "traefik.http.routers.grafana.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.grafana.middlewares=security-headers"
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+
+  # ─────────────────────────────────────────────────────────
+  # EXPORTERS — Node, Postgres, Redis, cAdvisor
+  # ─────────────────────────────────────────────────────────
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: chainhost-node-exporter
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    pid: host
+    command:
+      - '--path.rootfs=/host'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    volumes:
+      - /:/host:ro,rslave
+    networks:
+      - monitoring
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    container_name: chainhost-postgres-exporter
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      DATA_SOURCE_NAME: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+    networks:
+      - monitoring
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  redis-exporter:
+    image: oliver006/redis_exporter:latest
+    container_name: chainhost-redis-exporter
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      REDIS_ADDR: redis://redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    networks:
+      - monitoring
+      - backend
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: chainhost-cadvisor
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+    networks:
+      - monitoring
+
+  # ─────────────────────────────────────────────────────────
+  # ALERTING — Alertmanager
+  # ─────────────────────────────────────────────────────────
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: chainhost-alertmanager
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    networks:
+      - monitoring
+
+  # ─────────────────────────────────────────────────────────
+  # SECURITY — CrowdSec
+  # ─────────────────────────────────────────────────────────
+  crowdsec:
+    image: crowdsecurity/crowdsec:latest
+    container_name: chainhost-crowdsec
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - COLLECTIONS=crowdsecurity/traefik crowdsecurity/http-cve crowdsecurity/linux crowdsecurity/nginx
+      - GID=1000
+    volumes:
+      - ./security/crowdsec/acquis.yaml:/etc/crowdsec/acquis.yaml:ro
+      - crowdsec-db:/var/lib/crowdsec/data
+      - crowdsec-config:/etc/crowdsec
+      - traefik-logs:/var/log/traefik:ro
+    networks:
+      - crowdsec
+
+  crowdsec-bouncer:
+    image: fbonalair/traefik-crowdsec-bouncer:latest
+    container_name: chainhost-crowdsec-bouncer
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      CROWDSEC_BOUNCER_API_KEY: ${CROWDSEC_BOUNCER_KEY}
+      CROWDSEC_AGENT_HOST: crowdsec:8080
+    networks:
+      - crowdsec
+      - proxy
+    depends_on:
+      - crowdsec
+
+  # ─────────────────────────────────────────────────────────
+  # BACKUP SERVICE
+  # ─────────────────────────────────────────────────────────
+  backup:
+    build:
+      context: ./backups
+      dockerfile: Dockerfile
+    container_name: chainhost-backup
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - BACKUP_SCHEDULE=${BACKUP_SCHEDULE:-0 3 * * *}
+      - BACKUP_RETENTION_DAYS=${BACKUP_RETENTION_DAYS:-30}
+      - BACKUP_ENCRYPTION_KEY=${BACKUP_ENCRYPTION_KEY}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
+      - MINIO_PORT=${MINIO_PORT:-9000}
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      - BACKUP_S3_BUCKET=${BACKUP_S3_BUCKET:-chainhost-backups}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data:ro
+      - mail-data:/var/mail:ro
+      - forgejo-data:/var/forgejo:ro
+      - backup-data:/backups
+    networks:
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+# ─────────────────────────────────────────────────────────
+# NETWORKS
+# ─────────────────────────────────────────────────────────
+networks:
+  proxy:
+    name: chainhost-proxy
+    driver: bridge
+  backend:
+    name: chainhost-backend
+    driver: bridge
+    internal: true
+  mail:
+    name: chainhost-mail
+    driver: bridge
+  monitoring:
+    name: chainhost-monitoring
+    driver: bridge
+    internal: true
+  crowdsec:
+    name: chainhost-crowdsec
+    driver: bridge
+    internal: true
+
+# ─────────────────────────────────────────────────────────
+# VOLUMES
+# ─────────────────────────────────────────────────────────
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+  ipfs-data:
+  ipfs-staging:
+  mail-data:
+  mail-state:
+  mail-logs:
+  roundcube-data:
+  forgejo-data:
+  n8n-data:
+  traefik-certs:
+  traefik-logs:
+  prometheus-data:
+  grafana-data:
+  alertmanager-data:
+  crowdsec-db:
+  crowdsec-config:
+  backup-data:

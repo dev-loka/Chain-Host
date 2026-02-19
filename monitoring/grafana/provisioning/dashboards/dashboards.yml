@@ -1,0 +1,14 @@
+# Grafana Dashboard Provisioning
+apiVersion: 1
+
+providers:
+  - name: 'Chain Host'
+    orgId: 1
+    folder: 'Chain Host'
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: true

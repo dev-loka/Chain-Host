@@ -1,0 +1,107 @@
+# ============================================================
+# Traefik Dynamic Configuration — Security Middlewares
+# ============================================================
+
+http:
+  middlewares:
+    # ── Security Headers ────────────────────────────────
+    security-headers:
+      headers:
+        browserXssFilter: true
+        contentTypeNosniff: true
+        frameDeny: true
+        stsIncludeSubdomains: true
+        stsPreload: true
+        stsSeconds: 31536000
+        customFrameOptionsValue: "SAMEORIGIN"
+        referrerPolicy: "strict-origin-when-cross-origin"
+        permissionsPolicy: "camera=(), microphone=(), geolocation=(), payment=()"
+        customResponseHeaders:
+          X-Robots-Tag: "noindex, nofollow, nosnippet, noarchive"
+          X-Powered-By: ""
+          Server: ""
+        contentSecurityPolicy: >-
+          default-src 'self';
+          script-src 'self' 'unsafe-inline' 'unsafe-eval';
+          style-src 'self' 'unsafe-inline';
+          img-src 'self' data: blob: https:;
+          font-src 'self' data:;
+          connect-src 'self' wss: https:;
+          frame-ancestors 'self';
+          base-uri 'self';
+          form-action 'self';
+
+    # ── Rate Limiting ───────────────────────────────────
+    rate-limit:
+      rateLimit:
+        average: 100
+        burst: 50
+        period: 1m
+
+    rate-limit-strict:
+      rateLimit:
+        average: 10
+        burst: 5
+        period: 1m
+
+    # ── CORS Headers ────────────────────────────────────
+    cors-headers:
+      headers:
+        accessControlAllowMethods:
+          - GET
+          - POST
+          - PUT
+          - PATCH
+          - DELETE
+          - OPTIONS
+        accessControlAllowHeaders:
+          - Content-Type
+          - Authorization
+          - X-Requested-With
+        accessControlAllowOriginListRegex:
+          - "https://(.*\\.)?your-domain\\.com"
+        accessControlMaxAge: 86400
+        addVaryHeader: true
+
+    # ── Compression ─────────────────────────────────────
+    compress-response:
+      compress:
+        excludedContentTypes:
+          - text/event-stream
+
+    # ── CrowdSec Bouncer ────────────────────────────────
+    crowdsec-bouncer:
+      forwardAuth:
+        address: http://crowdsec-bouncer:8080/api/v1/forwardAuth
+        trustForwardHeader: true
+
+    # ── IP Whitelist (admin panels) ─────────────────────
+    admin-whitelist:
+      ipAllowList:
+        sourceRange:
+          - "127.0.0.1/32"
+          - "10.0.0.0/8"
+          - "172.16.0.0/12"
+          - "192.168.0.0/16"
+
+    # ── Retry middleware ────────────────────────────────
+    retry:
+      retry:
+        attempts: 3
+        initialInterval: 100ms
+
+  # ── TLS Configuration ──────────────────────────────────
+  tls:
+    options:
+      default:
+        minVersion: VersionTLS12
+        cipherSuites:
+          - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+          - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+          - TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+          - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+          - TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305
+          - TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305
+        sniStrict: true
+      modern:
+        minVersion: VersionTLS13

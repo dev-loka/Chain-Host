@@ -1,0 +1,231 @@
+// ============================================================
+// Prisma Schema — Chain Host
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── Users ─────────────────────────────────────────────────
+model User {
+  id            String    @id @default(uuid())
+  email         String?   @unique
+  username      String    @unique
+  passwordHash  String?
+  walletAddress String?   @unique
+  displayName   String?
+  avatarUrl     String?
+  role          Role      @default(USER)
+  isVerified    Boolean   @default(false)
+  twoFactorEnabled Boolean @default(false)
+  twoFactorSecret  String?
+
+  // Relations
+  websites      Website[]
+  apiKeys       ApiKey[]
+  sessions      Session[]
+  auditLogs     AuditLog[]
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([email])
+  @@index([walletAddress])
+}
+
+enum Role {
+  USER
+  ADMIN
+  SUPER_ADMIN
+}
+
+// ── Sessions (JWT refresh tracking) ───────────────────────
+model Session {
+  id            String   @id @default(uuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshToken  String   @unique
+  userAgent     String?
+  ipAddress     String?
+  expiresAt     DateTime
+  createdAt     DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// ── API Keys ──────────────────────────────────────────────
+model ApiKey {
+  id          String    @id @default(uuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name        String
+  keyHash     String    @unique
+  lastUsedAt  DateTime?
+  expiresAt   DateTime?
+  scopes      String[]  @default(["read"])
+  isActive    Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+
+  @@index([userId])
+  @@index([keyHash])
+}
+
+// ── Websites ──────────────────────────────────────────────
+model Website {
+  id            String        @id @default(uuid())
+  userId        String
+  user          User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name          String
+  slug          String        @unique
+  domain        String?       @unique
+  description   String?
+  siteType      SiteType      @default(STATIC)
+  status        SiteStatus    @default(DRAFT)
+  
+  // Storage
+  storagePath   String?
+  ipfsCid       String?
+  
+  // Blockchain integrity
+  contentHash   String?
+  txHash        String?
+  
+  // SSL
+  sslEnabled    Boolean       @default(true)
+  sslExpiresAt  DateTime?
+  
+  // Deploy config
+  buildCommand  String?
+  outputDir     String?       @default("dist")
+  envVars       Json?
+  
+  // Relations
+  deployments   Deployment[]
+  
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  @@index([userId])
+  @@index([slug])
+  @@index([domain])
+}
+
+enum SiteType {
+  STATIC
+  NEXTJS
+  NODE
+  PYTHON
+  PHP
+}
+
+enum SiteStatus {
+  DRAFT
+  BUILDING
+  DEPLOYING
+  LIVE
+  ERROR
+  SUSPENDED
+}
+
+// ── Deployments ───────────────────────────────────────────
+model Deployment {
+  id          String           @id @default(uuid())
+  websiteId   String
+  website     Website          @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  version     Int
+  commitHash  String?
+  status      DeploymentStatus @default(PENDING)
+  buildLog    String?
+  
+  // Blockchain
+  contentHash String?
+  txHash      String?
+  ipfsCid     String?
+  
+  startedAt   DateTime?
+  finishedAt  DateTime?
+  createdAt   DateTime         @default(now())
+
+  @@index([websiteId])
+  @@index([status])
+}
+
+enum DeploymentStatus {
+  PENDING
+  BUILDING
+  DEPLOYING
+  SUCCESS
+  FAILED
+  ROLLED_BACK
+}
+
+// ── Blockchain Records ────────────────────────────────────
+model BlockchainRecord {
+  id            String   @id @default(uuid())
+  entityType    String   // "website", "deployment", "email"
+  entityId      String
+  contentHash   String
+  txHash        String   @unique
+  chainId       Int
+  blockNumber   BigInt?
+  gasUsed       BigInt?
+  status        String   @default("pending")
+  createdAt     DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([txHash])
+}
+
+// ── Email Accounts ────────────────────────────────────────
+model EmailAccount {
+  id            String   @id @default(uuid())
+  address       String   @unique
+  displayName   String?
+  forwardTo     String?
+  isAlias       Boolean  @default(false)
+  quotaMb       Int      @default(1024)
+  usedMb        Int      @default(0)
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([address])
+}
+
+// ── Workflow Hooks ────────────────────────────────────────
+model WebhookEndpoint {
+  id          String   @id @default(uuid())
+  name        String
+  url         String
+  secret      String
+  events      String[] // ["deploy.success", "site.updated", etc.]
+  isActive    Boolean  @default(true)
+  lastCalledAt DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// ── Audit Log ─────────────────────────────────────────────
+model AuditLog {
+  id          String   @id @default(uuid())
+  userId      String?
+  user        User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action      String
+  entityType  String
+  entityId    String
+  metadata    Json?
+  ipAddress   String?
+  userAgent   String?
+  createdAt   DateTime @default(now())
+
+  @@index([userId])
+  @@index([action])
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}

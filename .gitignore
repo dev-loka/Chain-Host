@@ -1,0 +1,58 @@
+# ── Dependencies ────────────────────────
+node_modules/
+
+# ── Build Artifacts ─────────────────────
+dist/
+build/
+.next/
+out/
+
+# ── Environment ─────────────────────────
+.env
+.env.local
+.env.production
+
+# ── Docker ──────────────────────────────
+docker-compose.override.yml
+
+# ── IDE ─────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ──────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Logs ────────────────────────────────
+logs/
+*.log
+npm-debug.log*
+
+# ── Database ────────────────────────────
+*.sql.bak
+
+# ── Blockchain ──────────────────────────
+blockchain/artifacts/
+blockchain/cache/
+blockchain/typechain-types/
+
+# ── Backups ─────────────────────────────
+backups/data/
+*.tar.gz
+*.tar.gz.enc
+
+# ── Coverage ────────────────────────────
+coverage/
+.nyc_output/
+
+# ── Prisma ──────────────────────────────
+backend/prisma/migrations/
+
+# ── SSL ─────────────────────────────────
+ssl/
+*.pem
+*.key
+*.crt

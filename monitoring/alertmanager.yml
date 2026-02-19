@@ -1,0 +1,41 @@
+# ============================================================
+# Alertmanager Configuration — Chain Host
+# ============================================================
+
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: 'default'
+  group_by: ['alertname', 'severity']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - match:
+        severity: critical
+      receiver: 'critical'
+      repeat_interval: 1h
+    - match:
+        severity: warning
+      receiver: 'default'
+      repeat_interval: 4h
+
+receivers:
+  - name: 'default'
+    # Configure your notification channel:
+    # webhook_configs:
+    #   - url: 'https://n8n.your-domain.com/webhook/alerts'
+    #     send_resolved: true
+
+  - name: 'critical'
+    # webhook_configs:
+    #   - url: 'https://n8n.your-domain.com/webhook/critical-alerts'
+    #     send_resolved: true
+
+inhibit_rules:
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname']
